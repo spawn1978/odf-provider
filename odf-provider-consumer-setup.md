@@ -1,5 +1,16 @@
 # Conectar un Cluster Consumidor a un Cluster Proveedor OpenShift Data Foundation 4.x
 
+> **AVISO IMPORTANTE — Verificacion antes de usar en produccion**
+>
+> Este documento fue elaborado en base a conocimiento general de la arquitectura ODF provider-consumer (introducida en ODF 4.11+) y **no fue validado contra la documentacion oficial de Red Hat para ODF 4.20**.
+>
+> Las secciones que requieren verificacion previa estan marcadas con el indicador:
+> `⚠️ VERIFICAR CONTRA DOC OFICIAL`
+>
+> Antes de ejecutar en produccion, contrastar con:
+> - Documentacion oficial: `https://access.redhat.com/documentation/en-us/red_hat_openshift_data_foundation`
+> - Validacion de campos del CRD en el cluster real: `oc explain storagecluster.spec`
+
 ## Arquitectura del escenario
 
 ```
@@ -26,6 +37,218 @@ En este modelo:
 - [ ] ODF Operator instalado en ambos clusters (misma versión o compatible)
 - [ ] El namespace `openshift-storage` existe en ambos clusters
 - [ ] CLI `oc` configurada con acceso a ambos clusters (usar contextos o dos terminales separadas)
+
+---
+
+## Consideraciones de Red y Firewall
+
+Esta sección debe revisarse **antes de iniciar la configuración**. Un error de conectividad de red es la causa más frecuente de fallo en el proceso de registro del consumidor.
+
+### Flujo de tráfico entre clusters
+
+```
+CLUSTER B (Consumidor)                          CLUSTER A (Proveedor)
+─────────────────────                           ─────────────────────
+Nodos worker                                    OpenShift Router (Ingress)
+  │                                                       │
+  │  TCP 443 (HTTPS / gRPC sobre TLS)                     │  TLS Passthrough
+  └──────────────────────────────────────────────────────►│
+                                                           │
+                                                   ocs-provider-server
+                                                     (pod, TCP 50051)
+```
+
+El tráfico de datos de los PVs (E/S de bloque para RBD, acceso NFS para CephFS) fluye por un canal separado:
+
+```
+CLUSTER B — Nodos worker                        CLUSTER A — Nodos Ceph OSD/MON
+  │                                                       │
+  │  TCP 6789 (Ceph MON)                                  │
+  │  TCP 3300 (Ceph MON v2)                               │
+  │  TCP 6800-7300 (Ceph OSD / MDS / MGR)                 │
+  └──────────────────────────────────────────────────────►│
+```
+
+> **Importante:** El tráfico de control (registro, StorageConsumer) usa el puerto 443 via Route. El tráfico de datos de Ceph (lectura/escritura real de los PVs) necesita acceso directo a los puertos del cluster Ceph en el Cluster A. Ambos tipos de conectividad son necesarios.
+
+---
+
+### Tabla de puertos requeridos
+
+| Origen | Destino | Puerto | Protocolo | Descripcion |
+|--------|---------|--------|-----------|-------------|
+| Nodos worker — Cluster B | Router (Ingress) — Cluster A | `443` | TCP / gRPC+TLS | Registro del consumidor y comunicacion con el ODF provider server |
+| Nodos worker — Cluster B | Nodos Ceph MON — Cluster A | `6789` | TCP | Ceph Monitor (protocolo v1) |
+| Nodos worker — Cluster B | Nodos Ceph MON — Cluster A | `3300` | TCP | Ceph Monitor (protocolo v2, msgr2) |
+| Nodos worker — Cluster B | Nodos Ceph OSD — Cluster A | `6800–7300` | TCP | Trafico de datos de bloque (RBD) |
+| Nodos worker — Cluster B | Nodos Ceph MDS — Cluster A | `6800–7300` | TCP | Trafico de datos de CephFS |
+| Nodos worker — Cluster B | Nodos Ceph MGR — Cluster A | `6800–7300` | TCP | Ceph Manager |
+
+> **Rango OSD:** El rango `6800–7300` es el default de Ceph. En instalaciones con muchos OSDs puede ampliarse. Verificar el rango real con `oc rsh -n openshift-storage <ceph-mon-pod> ceph osd dump | grep "osd."`.
+
+---
+
+### Identificar las IPs de los nodos Ceph en el Cluster A
+
+Los nodos Ceph (MON, OSD, MDS) son los nodos de OpenShift etiquetados con `cluster.ocs.openshift.io/openshift-storage`. Obtener sus IPs:
+
+```bash
+# En el Cluster A: listar nodos de storage con sus IPs
+oc get nodes -l cluster.ocs.openshift.io/openshift-storage \
+  -o custom-columns='NAME:.metadata.name,IP:.status.addresses[?(@.type=="InternalIP")].address'
+```
+
+Si el Cluster B no tiene acceso directo a las IPs internas del Cluster A (redes separadas, on-prem vs cloud, etc.), se necesita un mecanismo de enrutamiento (ver sección "Escenarios de conectividad" más abajo).
+
+---
+
+### Identificar la IP del Router/Ingress del Cluster A
+
+El endpoint gRPC (puerto 443) apunta al Router de OpenShift del Cluster A. Obtener su IP:
+
+```bash
+# En el Cluster A: obtener IPs del Ingress Controller
+oc get svc -n openshift-ingress router-default \
+  -o jsonpath='{.status.loadBalancer.ingress[*].ip}'
+
+# Si usa NodePort o HostNetwork, obtener IPs de los nodos router
+oc get pods -n openshift-ingress -l ingresscontroller.operator.openshift.io/deployment-ingresscontroller=default \
+  -o wide
+```
+
+---
+
+### Verificar conectividad antes de configurar ODF
+
+Ejecutar estas pruebas **desde un nodo worker del Cluster B** usando `oc debug`:
+
+```bash
+# Abrir una sesion de debug en un nodo worker del Cluster B
+oc debug node/<worker-node-cluster-b>
+
+# Dentro del nodo, verificar el endpoint gRPC del proveedor (puerto 443)
+curl -k --max-time 5 https://ocs-provider-server-openshift-storage.apps.cluster-a.example.com
+
+# Verificar conectividad a los puertos Ceph MON del Cluster A
+# (reemplazar con las IPs reales obtenidas en el paso anterior)
+nc -zv <ip-nodo-ceph-1> 6789
+nc -zv <ip-nodo-ceph-1> 3300
+
+# Verificar un puerto del rango OSD
+nc -zv <ip-nodo-ceph-1> 6800
+```
+
+Si alguna de estas pruebas falla, la configuracion de ODF fallara en el mismo punto.
+
+---
+
+### Escenarios de conectividad
+
+#### Escenario 1: Ambos clusters en la misma red / datacenter
+
+Es el caso más simple. Los nodos del Cluster B tienen ruteo directo a los nodos del Cluster A. Solo se requiere que el firewall entre segmentos permita los puertos de la tabla anterior.
+
+Regla de firewall de ejemplo (iptables / nftables):
+
+```bash
+# Permitir trafico desde la red del Cluster B hacia los nodos Ceph del Cluster A
+# Adaptar segun la herramienta de firewall del entorno (firewalld, iptables, NSX, etc.)
+
+# Ejemplo con firewall-cmd en los nodos del Cluster A:
+firewall-cmd --permanent --add-rich-rule='
+  rule family="ipv4"
+  source address="<CIDR-nodos-cluster-b>"
+  port port="6789" protocol="tcp" accept'
+
+firewall-cmd --permanent --add-rich-rule='
+  rule family="ipv4"
+  source address="<CIDR-nodos-cluster-b>"
+  port port="3300" protocol="tcp" accept'
+
+firewall-cmd --permanent --add-rich-rule='
+  rule family="ipv4"
+  source address="<CIDR-nodos-cluster-b>"
+  port port="6800-7300" protocol="tcp" accept'
+
+firewall-cmd --reload
+```
+
+#### Escenario 2: Clusters en redes separadas (on-prem + cloud, o subredes distintas)
+
+Se requiere una de las siguientes soluciones:
+
+- **VPN site-to-site** entre las redes de ambos clusters (IPsec, WireGuard, etc.) con rutas que permitan acceso a las IPs internas de los nodos Ceph.
+- **Submariner** (proyecto oficial de Red Hat para conectividad multi-cluster en OpenShift): permite conectar las redes de Pods y Servicios entre clusters sin VPN manual.
+- **MetalLB + LoadBalancer** en el Cluster A para exponer los servicios Ceph con IPs externas (más complejo, requiere configuracion adicional de Ceph).
+
+Instalar Submariner (opcion recomendada para OpenShift):
+
+```bash
+# Instalar el operador Submariner en ambos clusters via OperatorHub
+# Luego crear el objeto ServiceDiscovery y Broker segun la documentacion de Submariner
+# https://submariner.io/getting-started/quickstart/openshift/
+```
+
+#### Escenario 3: Clusters en distintos proveedores cloud (AWS, Azure, GCP)
+
+- Usar **VPC Peering** o **Transit Gateway** (AWS), **VNet Peering** (Azure), **VPC Network Peering** (GCP) entre las VPCs/VNets de ambos clusters.
+- Asegurarse de que los **Security Groups / NSGs** permitan los puertos Ceph entre los rangos de IPs de los nodos.
+- El endpoint gRPC (443) puede resolverse via DNS publico si el Router del Cluster A tiene IP publica; de lo contrario, configurar DNS privado o entries en `/etc/hosts`.
+
+---
+
+### NetworkPolicy: asegurar que ODF no sea bloqueado internamente
+
+Si el cluster usa NetworkPolicies restrictivas, verificar que el namespace `openshift-storage` tenga los permisos necesarios para salir hacia las IPs externas del Cluster A:
+
+```bash
+# Ver NetworkPolicies existentes en el namespace openshift-storage del Cluster B
+oc get networkpolicy -n openshift-storage
+```
+
+Si hay politicas de egress restrictivas, agregar una que permita el trafico hacia el Cluster A:
+
+```yaml
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-odf-egress-to-provider
+  namespace: openshift-storage
+spec:
+  podSelector: {}
+  policyTypes:
+    - Egress
+  egress:
+    - to:
+        - ipBlock:
+            cidr: <CIDR-o-IP-del-cluster-a>/32
+      ports:
+        - protocol: TCP
+          port: 443
+        - protocol: TCP
+          port: 6789
+        - protocol: TCP
+          port: 3300
+    - to:
+        - ipBlock:
+            cidr: <CIDR-nodos-ceph-cluster-a>
+      ports:
+        - protocol: TCP
+          port: 6800
+          endPort: 7300
+```
+
+---
+
+### Checklist de red antes de proceder
+
+- [ ] Los nodos worker del Cluster B pueden resolver el DNS del Router del Cluster A (`*.apps.cluster-a.example.com`)
+- [ ] Puerto `443` accesible desde nodos worker del Cluster B hacia el Router del Cluster A
+- [ ] Puerto `6789` accesible desde nodos worker del Cluster B hacia nodos Ceph del Cluster A
+- [ ] Puerto `3300` accesible desde nodos worker del Cluster B hacia nodos Ceph del Cluster A
+- [ ] Rango `6800–7300` accesible desde nodos worker del Cluster B hacia nodos Ceph del Cluster A
+- [ ] No hay NetworkPolicies de egress bloqueando el namespace `openshift-storage` en el Cluster B
+- [ ] Firewall/Security Groups en el Cluster A permiten ingreso desde el CIDR de nodos del Cluster B
 
 ---
 
@@ -57,6 +280,8 @@ oc get cephcluster -n openshift-storage
 ---
 
 ### Paso 1.2 — Habilitar el modo proveedor en el StorageCluster
+
+> `⚠️ VERIFICAR CONTRA DOC OFICIAL` — Confirmar que el campo `allowRemoteStorageConsumers` existe en la version de ODF instalada. Ejecutar `oc explain storagecluster.spec | grep -i remote` para validar el nombre exacto del campo.
 
 El StorageCluster debe tener habilitada la capacidad de aceptar consumidores remotos. Editar el objeto:
 
@@ -105,6 +330,8 @@ ocs-provider-server   ClusterIP   172.30.x.x      50051/TCP   5m
 ---
 
 ### Paso 1.4 — Exponer el endpoint del proveedor fuera del cluster
+
+> `⚠️ VERIFICAR CONTRA DOC OFICIAL` — En algunas versiones de ODF, el operador puede crear esta Route automaticamente al habilitar `allowRemoteStorageConsumers`. Verificar si ya existe con `oc get route -n openshift-storage` antes de crearla manualmente para evitar duplicados.
 
 El servicio `ocs-provider-server` usa gRPC sobre TLS. Para que el Cluster B pueda alcanzarlo, se debe exponer via una Route con terminacion `passthrough` (no termina el TLS en el router, lo pasa directo al pod).
 
@@ -167,6 +394,11 @@ Si el campo esta vacio, usar el hostname de la Route obtenido en el paso anterio
 ---
 
 ### Paso 1.6 — Crear el objeto StorageConsumer y generar el ticket de onboarding
+
+> `⚠️ VERIFICAR CONTRA DOC OFICIAL` — El flujo de generacion del onboarding ticket puede variar segun la version:
+> - En algunas versiones se genera via la consola web de ODF (Data Foundation → Storage Consumers)
+> - El campo `spec.capacity` del `StorageConsumer` y el path exacto del ticket en `.status.onboardingTicket` deben confirmarse con `oc explain storageconsumer`
+> - Verificar si el `StorageConsumer` se crea manualmente o si es el cluster consumidor quien lo dispara automaticamente al crear su `StorageCluster`
 
 El ticket de onboarding es un token firmado que autoriza al Cluster B a conectarse. Se crea un `StorageConsumer` en el proveedor:
 
@@ -290,6 +522,11 @@ oc label node <worker-node-3> cluster.ocs.openshift.io/openshift-storage=''
 
 ### Paso 2.3 — Crear el StorageCluster en modo consumidor
 
+> `⚠️ VERIFICAR CONTRA DOC OFICIAL` — Este es el paso de mayor riesgo de imprecision. Los campos del `StorageCluster` en modo consumidor pueden variar:
+> - `spec.storageProviderEndpoint` y `spec.onboardingTicket` pueden estar anidados bajo `spec.externalStorage` u otra clave segun la version
+> - Ejecutar `oc explain storagecluster.spec` en el Cluster B para ver la estructura real antes de aplicar
+> - Algunas versiones pueden requerir campos adicionales o usar nombres distintos
+
 Reemplazar los valores de `storageProviderEndpoint` y `onboardingTicket` con los obtenidos del Cluster A en el Paso 1.6.
 
 ```yaml
@@ -344,6 +581,8 @@ El proceso puede tardar entre 5 y 15 minutos. El `StorageCluster` debe llegar a 
 ---
 
 ### Paso 2.5 — Verificar StorageClasses creadas
+
+> `⚠️ VERIFICAR CONTRA DOC OFICIAL` — Los nombres de las StorageClasses pueden diferir segun la version de ODF y la configuracion del StorageCluster. Usar `oc get storageclass` para ver los nombres reales creados en el entorno.
 
 Una vez que el StorageCluster este en `Ready`, el operador crea automaticamente las StorageClasses en el Cluster B:
 
@@ -536,7 +775,10 @@ oc describe storageconsumer cluster-b-consumer -n openshift-storage
 
 ## Referencias
 
-- [ODF Provider-Consumer Architecture (Red Hat Docs)](https://access.redhat.com/documentation/en-us/red_hat_openshift_data_foundation)
-- [StorageConsumer API Reference](https://access.redhat.com/documentation/en-us/red_hat_openshift_data_foundation)
-- `oc explain storagecluster.spec` — documentacion inline del CRD
-- `oc explain storageconsumer.spec` — documentacion inline del CRD
+> `⚠️ VERIFICAR CONTRA DOC OFICIAL` — Los links a continuacion apuntan al portal general de Red Hat. Navegar hasta la version exacta de ODF instalada en el entorno para asegurarse de usar la documentacion correcta.
+
+- [ODF — Pagina principal de documentacion (seleccionar version)](https://access.redhat.com/documentation/en-us/red_hat_openshift_data_foundation)
+- [Release Notes de ODF (verificar cambios de API entre versiones)](https://access.redhat.com/documentation/en-us/red_hat_openshift_data_foundation)
+- `oc explain storagecluster.spec` — validar campos disponibles en la version instalada
+- `oc explain storageconsumer.spec` — validar campos disponibles en la version instalada
+- `oc explain storageconsumer.status` — validar path del onboarding ticket
